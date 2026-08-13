@@ -3744,6 +3744,8 @@ static int _parse_select_type_param(
 			*param |= SELECT_LLN;
 		} else if (!xstrcasecmp(str_parameters, "CR_PACK_NODES")) {
 			*param |= SELECT_PACK_NODES;
+		} else if (!xstrcasecmp(str_parameters, "CR_GPU_BINPACK")) {
+			*param |= SELECT_GPU_BINPACK;
 		} else if (!xstrcasecmp(str_parameters, "LL_SHARED_GRES")) {
 			*param |= SELECT_LL_SHARED_GRES;
 		} else if (!xstrcasecmp(str_parameters,

@@ -1373,6 +1373,259 @@ fini:
 	return error_code;
 }
 
+/* Return true if the job requests any sharing GRES (a GPU). */
+static bool _job_gres_has_gpu(job_record_t *job_ptr)
+{
+	list_itr_t *iter;
+	gres_state_t *gres_state;
+	bool rc = false;
+
+	if (!job_ptr->gres_list_req)
+		return false;
+
+	iter = list_iterator_create(job_ptr->gres_list_req);
+	while ((gres_state = list_next(iter))) {
+		if (gres_id_sharing(gres_state->plugin_id)) {
+			rc = true;
+			break;
+		}
+	}
+	list_iterator_destroy(iter);
+
+	return rc;
+}
+
+/*
+ * A variation of _eval_nodes_lln() to bin-pack GPU jobs, selecting nodes with
+ * the fewest free GPUs of the requested type first.
+ */
+static int _eval_nodes_gpu_binpack(topology_eval_t *topo_eval)
+{
+	int i, i_start, i_end, error_code = SLURM_ERROR;
+	int rem_cpus, rem_nodes; /* remaining resources desired */
+	int min_rem_nodes;	/* remaining resources desired */
+	int total_cpus = 0;	/* #CPUs allocated to job */
+	int64_t rem_max_cpus;
+	job_record_t *job_ptr = topo_eval->job_ptr;
+	job_details_t *details_ptr = job_ptr->details;
+	bitstr_t *req_map = details_ptr->req_node_bitmap;
+	bitstr_t *orig_node_map = bit_copy(topo_eval->node_map);
+	bool all_done = false;
+	node_record_t *node_ptr;
+	list_t *node_weight_list = NULL;
+	node_weight_type *nwt;
+	list_itr_t *iter;
+	avail_res_t **avail_res_array = topo_eval->avail_res_array;
+	uint32_t min_nodes = topo_eval->min_nodes;
+	uint32_t req_nodes = topo_eval->req_nodes;
+	uint64_t maxtasks;
+
+	if (details_ptr->arbitrary_tpn) {
+		info("does not support arbitrary tasks distribution");
+		error_code = ESLURM_NOT_SUPPORTED;
+		goto fini;
+	}
+
+	topo_eval->avail_cpus = 0;
+
+	rem_cpus = details_ptr->min_cpus;
+	min_rem_nodes = min_nodes;
+	if ((details_ptr->num_tasks != NO_VAL) &&
+	    (details_ptr->num_tasks != 0))
+		topo_eval->max_nodes = MIN(topo_eval->max_nodes,
+					   details_ptr->num_tasks);
+	if ((topo_eval->gres_per_job = gres_sched_init(job_ptr->gres_list_req)))
+		rem_nodes = MIN(min_nodes, req_nodes);
+	else
+		rem_nodes = MAX(min_nodes, req_nodes);
+	rem_max_cpus = eval_nodes_get_rem_max_cpus(details_ptr, rem_nodes);
+	maxtasks = eval_nodes_set_max_tasks(job_ptr, rem_max_cpus,
+					    topo_eval->max_nodes);
+
+	i_start = bit_ffs(topo_eval->node_map);
+	if (i_start >= 0)
+		i_end = bit_fls(topo_eval->node_map);
+	else
+		i_end = i_start - 1;
+	if (req_map) {
+		for (i = i_start; i <= i_end; i++) {
+			if (!bit_test(req_map, i)) {
+				bit_clear(topo_eval->node_map, i);
+				continue;
+			}
+			node_ptr = node_record_table_ptr[i];
+			if (!avail_res_array[i] ||
+			    !avail_res_array[i]->avail_cpus) {
+				debug("%pJ required node %s lacks available resources",
+				      job_ptr, node_ptr->name);
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
+				goto fini;
+			}
+			if (topo_eval->max_nodes <= 0) {
+				log_flag(SELECT_TYPE, "%pJ requires nodes exceed maximum node limit",
+					 job_ptr);
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
+				goto fini;
+			}
+			eval_nodes_select_cores(topo_eval, i, min_rem_nodes);
+			(void) eval_nodes_cpus_to_use(topo_eval, i,
+						      rem_max_cpus,
+						      min_rem_nodes,
+						      &maxtasks, true);
+			if (topo_eval->avail_cpus <= 0) {
+				debug("%pJ required node %s not available",
+				      job_ptr, node_ptr->name);
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
+				goto fini;
+			}
+			total_cpus += topo_eval->avail_cpus;
+			rem_cpus -= topo_eval->avail_cpus;
+			rem_max_cpus -= topo_eval->avail_cpus;
+			rem_nodes--;
+			min_rem_nodes--;
+			/* leaving bitmap set, decr max limit */
+			topo_eval->max_nodes--;
+		}
+		if ((rem_nodes <= 0) && (rem_cpus <= 0) &&
+		    gres_sched_test(job_ptr->gres_list_req, job_ptr->job_id)) {
+			error_code = SLURM_SUCCESS;
+			bit_and(topo_eval->node_map, req_map);
+			goto fini;
+		}
+		if (topo_eval->max_nodes <= 0) {
+			topo_eval->eval_action = EVAL_ACTION_BREAK;
+			goto fini;
+		}
+		bit_and_not(orig_node_map, topo_eval->node_map);
+	} else {
+		bit_clear_all(topo_eval->node_map);
+	}
+
+	/* Compute CPUs already allocated to required nodes */
+	if ((details_ptr->max_cpus != NO_VAL) &&
+	    (total_cpus > details_ptr->max_cpus)) {
+		topo_eval->eval_action = EVAL_ACTION_BREAK;
+		info("%pJ can't use required nodes due to max CPU limit",
+		     job_ptr);
+		goto fini;
+	}
+
+	/*
+	 * Accumulate nodes within each node weight group, starting with the one
+	 * that has the fewest free GPUs of the requested type (best-fit).
+	 */
+	if (topo_eval->max_nodes == 0)
+		all_done = true;
+	node_weight_list = _build_node_weight_list(orig_node_map);
+	iter = list_iterator_create(node_weight_list);
+	while (!all_done && (nwt = list_next(iter))) {
+		while (!all_done) {
+			int best_idx = -1;
+			for (i = i_start; i <= i_end; i++) {
+				uint16_t gpus_i, gpus_b;
+				uint32_t cpu_i, cpu_b, tot_i, tot_b;
+
+				/* Node not available or already selected */
+				if (!bit_test(nwt->node_bitmap, i) ||
+				    bit_test(topo_eval->node_map, i))
+					continue;
+				if (!avail_res_array[i] ||
+				    !avail_res_array[i]->avail_cpus)
+					continue;
+				eval_nodes_select_cores(topo_eval, i,
+							min_rem_nodes);
+				if (topo_eval->avail_cpus == 0)
+					continue;
+				if (best_idx == -1) {
+					best_idx = i;
+					continue;
+				}
+				/*
+				 * Best-fit on GPUs: prefer the node with the
+				 * fewest free GPUs of the requested type, so
+				 * fragmented nodes fill first. Break ties
+				 * toward the least-loaded node (greatest ratio
+				 * of available to total CPUs), as in
+				 * _eval_nodes_lln().
+				 */
+				gpus_i = avail_res_array[i]->avail_gpus;
+				gpus_b = avail_res_array[best_idx]->avail_gpus;
+				if (gpus_i != gpus_b) {
+					if (gpus_i < gpus_b)
+						best_idx = i;
+					continue;
+				}
+				/* Equal free GPUs: break tie on CPU load. */
+				cpu_i = avail_res_array[i]->max_cpus;
+				cpu_b = avail_res_array[best_idx]->max_cpus;
+				tot_i = node_record_table_ptr[i]->cpus;
+				tot_b = node_record_table_ptr[best_idx]->cpus;
+				if ((cpu_b * tot_i) < (cpu_i * tot_b))
+					best_idx = i;
+			}
+			if (best_idx == -1) {
+				/* No more usable nodes left, get next weight */
+				break;
+			}
+			i = best_idx;
+
+			/*
+			 * The scan left avail_cpus set for the last node it
+			 * visited, not best_idx; recompute it for best_idx
+			 * before consuming it below.
+			 */
+			eval_nodes_select_cores(topo_eval, i, min_rem_nodes);
+			if (!eval_nodes_cpus_to_use(topo_eval, i, rem_max_cpus,
+						    min_rem_nodes, &maxtasks,
+						    true)) {
+				bit_clear(nwt->node_bitmap, i);
+				continue;
+			}
+			if (topo_eval->avail_cpus == 0) {
+				bit_clear(nwt->node_bitmap, i);
+				continue;
+			}
+
+			total_cpus += topo_eval->avail_cpus;
+			rem_cpus -= topo_eval->avail_cpus;
+			rem_max_cpus -= topo_eval->avail_cpus;
+			rem_nodes--;
+			min_rem_nodes--;
+			topo_eval->max_nodes--;
+			bit_set(topo_eval->node_map, i);
+			if ((rem_nodes <= 0) && (rem_cpus <= 0) &&
+			    gres_sched_test(job_ptr->gres_list_req,
+					    job_ptr->job_id)) {
+				error_code = SLURM_SUCCESS;
+				all_done = true;
+				break;
+			}
+			if (topo_eval->max_nodes == 0) {
+				all_done = true;
+				break;
+			}
+		}
+	}
+	list_iterator_destroy(iter);
+
+	if (error_code == SLURM_SUCCESS) {
+		/* Already succeeded */
+	} else if ((rem_cpus > 0) || (min_rem_nodes > 0) ||
+		   !gres_sched_test(job_ptr->gres_list_req, job_ptr->job_id)) {
+		error_code = SLURM_ERROR;
+		topo_eval->eval_action = EVAL_ACTION_RETRY_DEFAULT;
+	} else {
+		error_code = SLURM_SUCCESS;
+	}
+
+fini:
+	if (error_code == SLURM_SUCCESS)
+		eval_nodes_clip_socket_cores(topo_eval);
+	FREE_NULL_LIST(node_weight_list);
+	FREE_NULL_BITMAP(orig_node_map);
+	return error_code;
+}
+
 /*
  * A variation of _eval_nodes() to select resources at the end of the node
  * list to reduce fragmentation
@@ -1813,6 +2066,12 @@ extern int eval_nodes(topology_eval_t *topo_eval)
 		 * scheduler plugin
 		 */
 		return _eval_nodes_busy(topo_eval);
+	}
+
+	if ((topo_eval->cr_type & SELECT_GPU_BINPACK) &&
+	    _job_gres_has_gpu(topo_eval->job_ptr)) {
+		/* Bin-pack GPU jobs onto the nodes with the fewest free GPUs */
+		return _eval_nodes_gpu_binpack(topo_eval);
 	}
 
 	if ((topo_eval->cr_type & SELECT_LLN) ||

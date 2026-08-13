@@ -1111,7 +1111,11 @@ typedef enum {
 	 * nodes
 	 */
 	SELECT_CORE_DEFAULT_DIST_BLOCK = SLURM_BIT(12),
-	/* SLURM_BIT(13), empty */
+	/*
+	 * Bin-pack GPU jobs onto the most-utilized nodes (fewest free GPUs of
+	 * the requested type) rather than distributing them across idle nodes
+	 */
+	SELECT_GPU_BINPACK = SLURM_BIT(13),
 	/* Select nodes by "least loaded." */
 	SELECT_LLN = SLURM_BIT(14),
 	/* Allow multiple sharing gres per job */

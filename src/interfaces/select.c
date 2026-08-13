@@ -216,6 +216,11 @@ extern char *select_type_param_string(uint16_t select_type_param)
 			strcat(select_str, ",");
 		strcat(select_str, "CR_PACK_NODES");
 	}
+	if (select_type_param & SELECT_GPU_BINPACK) {
+		if (select_str[0])
+			strcat(select_str, ",");
+		strcat(select_str, "CR_GPU_BINPACK");
+	}
 	if (select_type_param & SELECT_LL_SHARED_GRES) {
 		if (select_str[0])
 			strcat(select_str, ",");

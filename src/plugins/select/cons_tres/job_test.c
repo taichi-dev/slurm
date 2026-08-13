@@ -822,6 +822,124 @@ static int _cmp_node(const void *x, const void *y)
 	return 0;
 }
 
+/*
+ * If the job requests a sharing GRES (a GPU), return true and set *type_id to
+ * the requested GPU type id (0 if untyped, or if multiple types are requested).
+ */
+static bool _job_gpu_type_id(job_record_t *job_ptr, uint32_t *type_id)
+{
+	list_itr_t *iter;
+	gres_state_t *gres_state;
+	bool found = false;
+
+	*type_id = 0;
+	if (!job_ptr->gres_list_req)
+		return false;
+
+	iter = list_iterator_create(job_ptr->gres_list_req);
+	while ((gres_state = list_next(iter))) {
+		gres_job_state_t *gres_js;
+
+		if (!gres_id_sharing(gres_state->plugin_id))
+			continue;
+		gres_js = gres_state->gres_data;
+		if (!found) {
+			found = true;
+			*type_id = gres_js ? gres_js->type_id : 0;
+		} else if (!gres_js || (gres_js->type_id != *type_id)) {
+			/* Mixed GPU types requested: fall back to aggregate. */
+			*type_id = 0;
+		}
+	}
+	list_iterator_destroy(iter);
+
+	return found;
+}
+
+/*
+ * Count of free GPUs on a node (sharing GRES): avail - alloc. When type_id is
+ * nonzero, count only that GPU type; otherwise count all GPU types.
+ */
+static uint64_t _node_gpu_free(node_record_t *node_ptr, uint32_t type_id)
+{
+	list_itr_t *iter;
+	gres_state_t *gres_state;
+	gres_node_state_t *gres_ns;
+	uint64_t free_gpus = 0;
+
+	if (!node_ptr->gres_list)
+		return 0;
+
+	iter = list_iterator_create(node_ptr->gres_list);
+	while ((gres_state = list_next(iter))) {
+		uint64_t agg_free;
+
+		if (!gres_id_sharing(gres_state->plugin_id))
+			continue;
+		gres_ns = gres_state->gres_data;
+		if (!gres_ns ||
+		    (gres_ns->gres_cnt_avail <= gres_ns->gres_cnt_alloc))
+			continue;
+		agg_free = gres_ns->gres_cnt_avail - gres_ns->gres_cnt_alloc;
+		if (!type_id) {
+			/* Untyped request: count all free GPUs. */
+			free_gpus += agg_free;
+			continue;
+		}
+		/*
+		 * Typed request: count only the requested GPU type, clamped
+		 * by the aggregate free count. Untyped allocations reduce the
+		 * aggregate but not type_cnt_alloc, so an unclamped typed
+		 * count can overstate what is free (mirrors
+		 * _build_sock_gres_by_type()).
+		 */
+		for (uint16_t t = 0; t < gres_ns->type_cnt; t++) {
+			uint64_t type_free;
+
+			if (gres_ns->type_id[t] != type_id)
+				continue;
+			if (gres_ns->type_cnt_avail[t] <=
+			    gres_ns->type_cnt_alloc[t])
+				continue;
+			type_free = gres_ns->type_cnt_avail[t] -
+				    gres_ns->type_cnt_alloc[t];
+			free_gpus += MIN(type_free, agg_free);
+		}
+	}
+	list_iterator_destroy(iter);
+
+	return free_gpus;
+}
+
+/* A node and its free GPUs of the requested type, for binpack sorting. */
+typedef struct {
+	node_record_t *node;
+	uint64_t free_gpu;
+} binpack_node_t;
+
+/*
+ * Comparator for CR_GPU_BINPACK: order by node weight first (like _cmp_node()),
+ * then by fewest free GPUs of the requested type so a single-node GPU job packs
+ * onto an already-fragmented node rather than an idle one. _get_one_res() takes
+ * the first feasible node in this order.
+ */
+static int _cmp_node_gpu_binpack(const void *x, const void *y)
+{
+	const binpack_node_t *a = x;
+	const binpack_node_t *b = y;
+
+	if (a->node->sched_weight < b->node->sched_weight)
+		return -1;
+	else if (a->node->sched_weight > b->node->sched_weight)
+		return 1;
+	if (a->free_gpu < b->free_gpu)
+		return -1;
+	else if (a->free_gpu > b->free_gpu)
+		return 1;
+	return 0;
+}
+
+
 static int _get_one_res(topology_eval_t *topo_eval,
 			node_use_record_t *node_usage, bool test_only,
 			bool will_run, bitstr_t **part_core_map,
@@ -833,6 +951,7 @@ static int _get_one_res(topology_eval_t *topo_eval,
 	job_record_t *job_ptr = topo_eval->job_ptr;
 	bitstr_t *req_map = job_ptr->details->req_node_bitmap;
 	uint32_t s_p_n = _socks_per_node(job_ptr);
+	uint32_t gpu_type_id = 0;
 	int32_t avail_node_cnt;
 	int rc = SLURM_ERROR;
 	bitstr_t **orig_core_array;
@@ -860,7 +979,27 @@ static int _get_one_res(topology_eval_t *topo_eval,
 	     (node_ptr = next_node_bitmap(topo_eval->node_map, &i)); i++)
 		sorted_nodes[idx++] = node_ptr;
 
-	qsort(sorted_nodes, avail_node_cnt, sizeof(*sorted_nodes), _cmp_node);
+	if ((topo_eval->cr_type & SELECT_GPU_BINPACK) &&
+	    _job_gpu_type_id(job_ptr, &gpu_type_id)) {
+		/*
+		 * Bin-pack: order candidate nodes by fewest free GPUs of the
+		 * requested type first. Key each node once, then sort.
+		 */
+		binpack_node_t *bn = xcalloc(avail_node_cnt, sizeof(*bn));
+
+		for (int k = 0; k < avail_node_cnt; k++) {
+			bn[k].node = sorted_nodes[k];
+			bn[k].free_gpu = _node_gpu_free(sorted_nodes[k],
+							gpu_type_id);
+		}
+		qsort(bn, avail_node_cnt, sizeof(*bn), _cmp_node_gpu_binpack);
+		for (int k = 0; k < avail_node_cnt; k++)
+			sorted_nodes[k] = bn[k].node;
+		xfree(bn);
+	} else {
+		qsort(sorted_nodes, avail_node_cnt, sizeof(*sorted_nodes),
+		      _cmp_node);
+	}
 
 check_nodes:
 	for (int idx = 0; idx < avail_node_cnt; idx++) {
