@@ -335,6 +335,10 @@ static bool _node_state_suspendable(node_record_t *node_ptr)
 	if (!IS_NODE_IDLE(node_ptr) && !IS_NODE_DOWN(node_ptr))
 		return false;
 
+	/* A DOWN node may still hold jobs that kept their allocation */
+	if (node_down_holds_jobs(node_ptr))
+		return false;
+
 	/* Must not have these flags */
 	if (IS_NODE_COMPLETING(node_ptr) ||
 	    IS_NODE_POWERING_UP(node_ptr) ||
@@ -495,8 +499,8 @@ static bool _node_needs_reboot(node_record_t *node_ptr)
 	else if (IS_NODE_FUTURE(node_ptr) &&
 		 (node_ptr->last_response == (time_t) 0))
 		want_reboot = true; /* system just restarted */
-	else if (IS_NODE_DOWN(node_ptr))
-		want_reboot = true;
+	else if (IS_NODE_DOWN(node_ptr) && !node_down_holds_jobs(node_ptr))
+		want_reboot = true; /* unless jobs kept their allocation */
 	else
 		want_reboot = false;
 	if (!want_reboot) {

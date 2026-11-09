@@ -1378,6 +1378,37 @@ extern void kill_job_on_node(job_record_t *job_ptr, node_record_t *node_ptr);
  */
 extern int kill_running_job_by_node_ptr(node_record_t *node_ptr);
 
+/*
+ * kill_running_job_by_down_node_ptr - As kill_running_job_by_node_ptr(), for
+ *	a node that has just been set DOWN.
+ * IN node_ptr - node that was set DOWN; it must already be DOWN
+ * IN retain - true if the node stays in the cluster: a running job for which
+ *	job_retain_alloc_on_node_fail() is true is then left running with its
+ *	whole allocation, including its resources on this node
+ * RET number of killed jobs
+ */
+extern int kill_running_job_by_down_node_ptr(node_record_t *node_ptr,
+					     bool retain);
+
+/*
+ * job_retain_alloc_on_node_fail - Return true if a node failure must leave
+ *	this job running with its whole allocation: a running external job
+ *	submitted with --no-kill (kill_on_node_fail=0), other than a hetjob.
+ *	slurmd has no part in running such a job, so its submitter, not
+ *	slurmctld, decides when to release the allocation.
+ */
+extern bool job_retain_alloc_on_node_fail(job_record_t *job_ptr);
+
+/*
+ * job_shrink_on_node_fail - Return true if a node failure must remove the
+ *	failed node from this job and leave it running on its other nodes
+ *	(--no-kill), instead of killing it. Never true for an external job:
+ *	slurmctld cannot know that its workload on the failed node stopped.
+ *	A job without details is not excluded; callers that require details
+ *	check for them.
+ */
+extern bool job_shrink_on_node_fail(job_record_t *job_ptr);
+
 /* list_compare_config - compare two entry from the config list based upon
  *	weight, see common/list.h for documentation */
 int list_compare_config (void *config_entry1, void *config_entry2);
@@ -1432,6 +1463,35 @@ extern int load_all_part_state(uint16_t reconfig_flags);
  * IN job_ptr  - pointer to job that is starting
  */
 extern void make_node_alloc(node_record_t *node_ptr, job_record_t *job_ptr);
+
+/*
+ * make_node_retained - restore what _make_node_down() reset on a node for a
+ *	job that keeps its allocation there (see job_retain_alloc_on_node_fail()).
+ *	The node's job counters still include the job; only the idle/share
+ *	bitmaps, owner and MCS label are restored, as make_node_alloc() set them.
+ * IN node_ptr - DOWN node in the job's allocation
+ * IN job_ptr  - job keeping its allocation
+ */
+extern void make_node_retained(node_record_t *node_ptr, job_record_t *job_ptr);
+
+/*
+ * set_node_job_owner - set a node's owner (exclusive-user job) and MCS label
+ *	for a job allocated on it, as make_node_alloc() does.
+ * IN node_ptr - node in the job's allocation
+ * IN job_ptr  - job allocated on the node
+ * IN add_owner_job - also count the job in owner_job_cnt, which
+ *	make_node_idle() decrements when the job leaves the node
+ */
+extern void set_node_job_owner(node_record_t *node_ptr, job_record_t *job_ptr,
+			       bool add_owner_job);
+
+/*
+ * node_down_holds_jobs - Return true if the node is DOWN and still holds
+ *	running or suspended jobs, which kept their allocation when it went DOWN
+ *	(see job_retain_alloc_on_node_fail()). Such a node must not be powered
+ *	down, rebooted or deleted until those jobs end.
+ */
+extern bool node_down_holds_jobs(node_record_t *node_ptr);
 
 extern void node_mgr_make_node_blocked(job_record_t *job_ptr, bool set);
 

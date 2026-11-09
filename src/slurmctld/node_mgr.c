@@ -161,12 +161,16 @@ static void	_drain_node(node_record_t *node_ptr, char *reason,
 static void    _make_node_unavail(node_record_t *node_ptr);
 static void 	_make_node_down(node_record_t *node_ptr,
 				time_t event_time);
+static uint32_t _node_base_state_from_jobs(node_record_t *node_ptr);
 static bool	_node_is_hidden(node_record_t *node_ptr,
 				pack_node_info_t *pack_info);
 static void 	_pack_node(node_record_t *dump_node_ptr, buf_t *buffer,
 			   uint16_t protocol_version, uint16_t show_flags);
 static void _reconcile_tres_drain(node_record_t *node_ptr, char *reason,
 				  uid_t auth_uid, time_t now);
+static bool	_job_owns_node(job_record_t *job_ptr);
+static void	_release_node_job_owner(node_record_t *node_ptr,
+					job_record_t *job_ptr);
 static void	_sync_bitmaps(node_record_t *node_ptr, int job_count);
 static void	_update_config_ptr(bitstr_t *bitmap,
 				   config_record_t *config_ptr);
@@ -2903,6 +2907,7 @@ extern int update_node(slurm_msg_t *msg, update_node_msg_t *update_node_msg,
 		int err_code = 0, kv_rc;
 		bool acct_updated = false;
 		bool resume_keep_tres = false;
+		bool idle_requested = false;
 		bool resume_tres = false;
 		bool update_db = false;
 
@@ -3311,7 +3316,9 @@ extern int update_node(slurm_msg_t *msg, update_node_msg_t *update_node_msg,
 				/* We must set node DOWN before killing
 				 * its jobs */
 				_make_node_down(node_ptr, now);
-				kill_running_job_by_node_ptr(node_ptr);
+				/* A FUTURE node leaves the cluster */
+				kill_running_job_by_down_node_ptr(
+					node_ptr, (state_val == NODE_STATE_DOWN));
 				if (state_val == NODE_STATE_FUTURE) {
 					bool dyn_norm_node = false;
 					if (IS_NODE_DYNAMIC_FUTURE(node_ptr)) {
@@ -3346,9 +3353,19 @@ extern int update_node(slurm_msg_t *msg, update_node_msg_t *update_node_msg,
 						node_ptr->reason_uid);
 				}
 			} else if (state_val == NODE_STATE_IDLE) {
+				/*
+				 * A DOWN node can still hold jobs that kept
+				 * their allocation when it went DOWN (see
+				 * job_retain_alloc_on_node_fail()). It returns
+				 * to service ALLOCATED while any of them runs.
+				 */
+				idle_requested = true;
+
 				/* assume they want to clear DRAIN and
 				 * FAIL flags too */
 				if (IS_NODE_DOWN(node_ptr)) {
+					state_val = _node_base_state_from_jobs(
+						node_ptr);
 					trigger_node_up(node_ptr);
 					clusteracct_storage_g_node_up(
 						acct_db_conn,
@@ -3369,12 +3386,18 @@ extern int update_node(slurm_msg_t *msg, update_node_msg_t *update_node_msg,
 				if (!IS_NODE_NO_RESPOND(node_ptr) ||
 				     IS_NODE_POWERED_DOWN(node_ptr))
 					make_node_avail(node_ptr);
-				bit_set (idle_node_bitmap, node_ptr->index);
 				bit_set (up_node_bitmap, node_ptr->index);
-				if (IS_NODE_POWERED_DOWN(node_ptr))
-					node_ptr->last_busy = 0;
-				else
-					node_ptr->last_busy = now;
+				if (state_val == NODE_STATE_ALLOCATED) {
+					bit_clear(idle_node_bitmap,
+						  node_ptr->index);
+				} else {
+					bit_set(idle_node_bitmap,
+						node_ptr->index);
+					if (IS_NODE_POWERED_DOWN(node_ptr))
+						node_ptr->last_busy = 0;
+					else
+						node_ptr->last_busy = now;
+				}
 			} else if (state_val == NODE_STATE_ALLOCATED) {
 				if (!IS_NODE_DRAIN(node_ptr) &&
 				    !IS_NODE_FAIL(node_ptr)  &&
@@ -3437,7 +3460,8 @@ extern int update_node(slurm_msg_t *msg, update_node_msg_t *update_node_msg,
 					if (IS_NODE_REBOOT_ISSUED(node_ptr) &&
 					    IS_NODE_DOWN(node_ptr)) {
 						node_ptr->node_state =
-							NODE_STATE_IDLE |
+							_node_base_state_from_jobs(
+								node_ptr) |
 							(node_ptr->node_state &
 							 NODE_STATE_FLAGS);
 					}
@@ -3640,11 +3664,13 @@ extern int update_node(slurm_msg_t *msg, update_node_msg_t *update_node_msg,
 		/*
 		 * RESUME_KEEP_TRES, UNDRAIN and IDLE clear the whole-node drain
 		 * and leave the TRES drained. A node still over MaxDrainedTres
-		 * must be redrained with the MaxDrainedTres reason
+		 * must be redrained with the MaxDrainedTres reason. Every IDLE
+		 * request sets idle_requested, including one for a DOWN node
+		 * that returned ALLOCATED because it still holds jobs.
 		 */
 		if (resume_keep_tres ||
 		    (update_node_msg->node_state == NODE_STATE_UNDRAIN) ||
-		    (state_val == NODE_STATE_IDLE))
+		    idle_requested)
 			(void) _enforce_max_drained_tres(node_ptr,
 							 msg->auth.uid, now,
 							 true);
@@ -5794,9 +5820,10 @@ extern int validate_node_specs(slurm_msg_t *slurm_msg, bool *newly_up)
 			     __func__, reg_msg->node_name, node_ptr->boot_time,
 			     node_ptr->last_response);
 			_make_node_down(node_ptr, now);
-			kill_running_job_by_node_ptr(node_ptr);
+			kill_running_job_by_down_node_ptr(node_ptr, true);
 			last_node_update = now;
-			reg_msg->job_count = 0;
+			/* Only jobs that kept their allocation remain */
+			reg_msg->job_count = node_ptr->run_job_cnt;
 		} else if (IS_NODE_ALLOCATED(node_ptr) &&
 			   (reg_msg->job_count == 0)) { /* job vanished */
 			node_ptr->node_state = NODE_STATE_IDLE | node_flags;
@@ -5986,8 +6013,14 @@ static void _node_did_resp(node_record_t *node_ptr)
 	     (node_ptr->boot_req_time != 0) ||
 	     ((slurm_conf.ret2service == RETURN_TO_SERVICE_NON_RESP) &&
 	      !xstrcmp(node_ptr->reason, "Not responding")))) {
-		node_ptr->last_busy = now;
-		node_ptr->node_state = NODE_STATE_IDLE | node_flags;
+		/*
+		 * Jobs that kept their allocation when the node went DOWN
+		 * (see job_retain_alloc_on_node_fail()) still hold it.
+		 */
+		node_ptr->node_state = _node_base_state_from_jobs(node_ptr) |
+				       node_flags;
+		if (IS_NODE_IDLE(node_ptr))
+			node_ptr->last_busy = now;
 		node_ptr->resume_after = 0;
 		info("node_did_resp: node %s returned to service",
 		     node_ptr->name);
@@ -6156,8 +6189,9 @@ void set_node_down_ptr(node_record_t *node_ptr, char *reason)
 
 	set_node_reason(node_ptr, reason, now);
 	_make_node_down(node_ptr, now);
-	(void) kill_running_job_by_node_ptr(node_ptr);
-	_sync_bitmaps(node_ptr, 0);
+	(void) kill_running_job_by_down_node_ptr(node_ptr, true);
+	/* Only jobs that kept their allocation remain */
+	_sync_bitmaps(node_ptr, node_ptr->run_job_cnt);
 }
 
 /*
@@ -6343,18 +6377,7 @@ extern void make_node_alloc(node_record_t *node_ptr, job_record_t *job_ptr)
 		(node_ptr->no_share_job_cnt)++;
 	}
 
-	if ((job_ptr->details &&
-	     (job_ptr->details->whole_node & WHOLE_NODE_USER)) ||
-	    (job_ptr->part_ptr &&
-	     (job_ptr->part_ptr->flags & PART_FLAG_EXCLUSIVE_USER))) {
-		node_ptr->owner_job_cnt++;
-		node_ptr->owner = job_ptr->user_id;
-	}
-
-	if (slurm_mcs_get_select(job_ptr) == 1) {
-		xfree(node_ptr->mcs_label);
-		node_ptr->mcs_label = xstrdup(job_ptr->mcs_label);
-	}
+	set_node_job_owner(node_ptr, job_ptr, true);
 
 	node_flags = node_ptr->node_state & NODE_STATE_FLAGS;
 	node_ptr->node_state = NODE_STATE_ALLOCATED | node_flags;
@@ -6377,6 +6400,82 @@ extern void make_node_alloc(node_record_t *node_ptr, job_record_t *job_ptr)
 	}
 
 	last_node_update = time(NULL);
+}
+
+extern void make_node_retained(node_record_t *node_ptr, job_record_t *job_ptr)
+{
+	xassert(node_ptr);
+	xassert(job_ptr);
+
+	bit_clear(idle_node_bitmap, node_ptr->index);
+	if (job_ptr->details && (job_ptr->details->share_res == 0))
+		bit_clear(share_node_bitmap, node_ptr->index);
+
+	/* owner_job_cnt still counts the job, only owner was reset */
+	set_node_job_owner(node_ptr, job_ptr, false);
+
+	last_node_update = time(NULL);
+}
+
+extern bool node_down_holds_jobs(node_record_t *node_ptr)
+{
+	return (IS_NODE_DOWN(node_ptr) &&
+		(node_ptr->run_job_cnt || node_ptr->sus_job_cnt));
+}
+
+/*
+ * Base state of a node returning to service from DOWN: ALLOCATED while jobs
+ * that kept their allocation through the DOWN (see
+ * job_retain_alloc_on_node_fail()) still run on it, IDLE otherwise. A node
+ * with only suspended jobs is IDLE, as _suspend_job_nodes() leaves it.
+ */
+static uint32_t _node_base_state_from_jobs(node_record_t *node_ptr)
+{
+	if (node_ptr->run_job_cnt)
+		return NODE_STATE_ALLOCATED;
+	return NODE_STATE_IDLE;
+}
+
+/* Return true if the job makes its user the owner of its nodes */
+static bool _job_owns_node(job_record_t *job_ptr)
+{
+	return ((job_ptr->details &&
+		 (job_ptr->details->whole_node & WHOLE_NODE_USER)) ||
+		(job_ptr->part_ptr &&
+		 (job_ptr->part_ptr->flags & PART_FLAG_EXCLUSIVE_USER)));
+}
+
+/*
+ * Release a job's share of the node's ownership when the job leaves the node:
+ * the owner is cleared once no job of that user owns the node any more.
+ */
+static void _release_node_job_owner(node_record_t *node_ptr,
+				    job_record_t *job_ptr)
+{
+	if (!job_ptr || !_job_owns_node(job_ptr))
+		return;
+
+	if (node_ptr->owner_job_cnt == 0) {
+		error("%s: node_ptr->owner_job_cnt underflow", __func__);
+	} else if (--node_ptr->owner_job_cnt == 0) {
+		node_ptr->owner = NO_VAL;
+		xfree(node_ptr->mcs_label);
+	}
+}
+
+extern void set_node_job_owner(node_record_t *node_ptr, job_record_t *job_ptr,
+			       bool add_owner_job)
+{
+	if (_job_owns_node(job_ptr)) {
+		if (add_owner_job)
+			node_ptr->owner_job_cnt++;
+		node_ptr->owner = job_ptr->user_id;
+	}
+
+	if (slurm_mcs_get_select(job_ptr) == 1) {
+		xfree(node_ptr->mcs_label);
+		node_ptr->mcs_label = xstrdup(job_ptr->mcs_label);
+	}
 }
 
 /* make_node_avail - flag specified node as available */
@@ -6466,6 +6565,18 @@ extern void make_node_comp(node_record_t *node_ptr, job_record_t *job_ptr,
 		(node_ptr->comp_job_cnt)++;
 		node_ptr->node_state |= NODE_STATE_COMPLETING;
 		bit_set(cg_node_bitmap, node_ptr->index);
+	} else if (job_ptr->bit_flags & EXTERNAL_JOB) {
+		/*
+		 * deallocate_nodes() removes such a node from node_bitmap_cg,
+		 * so an external job, which gets no epilog complete from
+		 * slurmd, never reaches make_node_idle() for it. Release the
+		 * job's share of the node's ownership here instead, as
+		 * make_node_idle() does (on a DOWN node it may have been
+		 * restored by make_node_retained()). Other jobs are not
+		 * released here: they release it in make_node_idle(), which
+		 * a DOWN node, reporting no epilog complete, never reaches.
+		 */
+		_release_node_job_owner(node_ptr, job_ptr);
 	}
 	node_flags = node_ptr->node_state & NODE_STATE_FLAGS;
 
@@ -6488,6 +6599,11 @@ extern void make_node_comp(node_record_t *node_ptr, job_record_t *job_ptr,
 
 	if (IS_NODE_DOWN(node_ptr)) {
 		debug3("%s: Node %s being left DOWN", __func__, node_ptr->name);
+		if (!node_ptr->run_job_cnt && !node_ptr->sus_job_cnt &&
+		    !node_ptr->comp_job_cnt && !node_ptr->hold_cnt) {
+			node_ptr->owner = NO_VAL;
+			xfree(node_ptr->mcs_label);
+		}
 	} else if (node_ptr->run_job_cnt)
 		node_ptr->node_state = NODE_STATE_ALLOCATED | node_flags;
 	else {
@@ -6705,19 +6821,7 @@ void make_node_idle(node_record_t *node_ptr, job_record_t *job_ptr)
 	}
 
 fini:
-	if (job_ptr &&
-	    ((job_ptr->details &&
-	      (job_ptr->details->whole_node & WHOLE_NODE_USER)) ||
-	     (job_ptr->part_ptr &&
-	      (job_ptr->part_ptr->flags & PART_FLAG_EXCLUSIVE_USER)))) {
-		if (node_ptr->owner_job_cnt == 0) {
-			error("%s: node_ptr->owner_job_cnt underflow",
-			      __func__);
-		} else if (--node_ptr->owner_job_cnt == 0) {
-			node_ptr->owner = NO_VAL;
-			xfree(node_ptr->mcs_label);
-		}
-	}
+	_release_node_job_owner(node_ptr, job_ptr);
 	last_node_update = now;
 }
 
@@ -7473,7 +7577,7 @@ static int _delete_node_ptr(node_record_t *node_ptr)
 		return ESLURM_INVALID_NODE_STATE;
 	}
 	if (IS_NODE_ALLOCATED(node_ptr) || IS_NODE_COMPLETING(node_ptr) ||
-	    node_ptr->hold_cnt) {
+	    node_ptr->hold_cnt || node_down_holds_jobs(node_ptr)) {
 		error("Node '%s' can't be delete because it's still in use.",
 		      node_ptr->name);
 		return ESLURM_NODES_BUSY;

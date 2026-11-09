@@ -258,6 +258,7 @@ typedef struct {
 	part_record_t *part_ptr;
 	bool requeue_on_resume_failure;
 	bool resume_failure;
+	bool retain_on_node_down;
 } foreach_kill_job_by_t;
 
 typedef struct {
@@ -3058,6 +3059,43 @@ static bool _het_job_on_node(job_record_t *job_ptr, int node_inx)
 			       _find_het_job_on_node, &node_inx);
 }
 
+extern bool job_retain_alloc_on_node_fail(job_record_t *job_ptr)
+{
+	/*
+	 * Hetjobs are left out. A node failure fails every component of a
+	 * hetjob together: _het_job_on_node() counts all components as on the
+	 * node when any one of them is. Retaining an external component while
+	 * the others fail is not supported, so an external hetjob fails with
+	 * the node like any other hetjob.
+	 */
+	return ((job_ptr->bit_flags & EXTERNAL_JOB) &&
+		(job_ptr->kill_on_node_fail == 0) &&
+		!job_ptr->het_job_id &&
+		IS_JOB_RUNNING(job_ptr) &&
+		!IS_JOB_CONFIGURING(job_ptr) &&
+		!IS_JOB_COMPLETING(job_ptr));
+}
+
+extern bool job_shrink_on_node_fail(job_record_t *job_ptr)
+{
+	/*
+	 * An arbitrary job's task layout is defined by its node list, which
+	 * cannot be rebuilt for a smaller node set, so it cannot survive
+	 * losing a node.
+	 *
+	 * Never remove a node from an external job: slurmctld cannot know that
+	 * the job's workload on that node stopped, so freeing the node's
+	 * resources could allocate them twice. Unless
+	 * job_retain_alloc_on_node_fail() keeps it, the job is killed instead.
+	 */
+	return ((job_ptr->kill_on_node_fail == 0) &&
+		(job_ptr->node_cnt > 1) &&
+		!(job_ptr->bit_flags & EXTERNAL_JOB) &&
+		(!job_ptr->details ||
+		 ((job_ptr->details->task_dist & SLURM_DIST_STATE_BASE) !=
+		  SLURM_DIST_ARBITRARY)));
+}
+
 static int _foreach_kill_running_job_by_node(void *x, void *arg)
 {
 	job_record_t *job_ptr = x;
@@ -3101,17 +3139,24 @@ static int _foreach_kill_running_job_by_node(void *x, void *arg)
 			error("Node %s comp_job_cnt underflow, %pJ",
 			      node_ptr->name, job_ptr);
 		}
+	} else if (foreach_kill_job_by->retain_on_node_down &&
+		   job_retain_alloc_on_node_fail(job_ptr)) {
+		/*
+		 * slurmd neither launched nor tracks this job, so it may still
+		 * be running. Keep the whole allocation, including this node,
+		 * until the job is cancelled or reaches its time limit. The
+		 * node is DOWN, so nothing new is scheduled on it meanwhile.
+		 */
+		info("Retaining %pJ allocation on DOWN node %s (external job with kill_on_node_fail=0)",
+		     job_ptr, node_ptr->name);
+		make_node_retained(node_ptr, job_ptr);
 	} else if (IS_JOB_RUNNING(job_ptr) || suspended) {
 		foreach_kill_job_by->kill_job_cnt++;
 		/*
-		 * An arbitrary job's task layout is defined by its node list,
-		 * which cannot be rebuilt for a smaller node set, so it cannot
-		 * survive losing a node.
+		 * A job that is still configuring (its nodes booting) is
+		 * requeued or killed below rather than shrunk.
 		 */
-		if ((job_ptr->details) && (job_ptr->kill_on_node_fail == 0) &&
-		    (job_ptr->node_cnt > 1) &&
-		    ((job_ptr->details->task_dist & SLURM_DIST_STATE_BASE) !=
-		     SLURM_DIST_ARBITRARY) &&
+		if (job_ptr->details && job_shrink_on_node_fail(job_ptr) &&
 		    !IS_JOB_CONFIGURING(job_ptr)) {
 			bitstr_t *orig_job_node_bitmap;
 
@@ -3267,13 +3312,15 @@ extern void fail_job_on_node(job_record_t *job_ptr, node_record_t *node_ptr,
 		last_job_update = foreach_kill_job_by.now;
 }
 
-extern int kill_running_job_by_node_ptr(node_record_t *node_ptr)
+static int _kill_running_job_by_node_ptr(node_record_t *node_ptr,
+					 bool retain_on_node_down)
 {
 	list_itr_t *iter;
 	job_record_t *job_ptr = NULL;
 	foreach_kill_job_by_t foreach_kill_job_by = {
 		.node_ptr = node_ptr,
 		.now = time(NULL),
+		.retain_on_node_down = retain_on_node_down,
 	};
 
 	xassert(verify_lock(JOB_LOCK, WRITE_LOCK));
@@ -3300,6 +3347,19 @@ extern int kill_running_job_by_node_ptr(node_record_t *node_ptr)
 		last_job_update = foreach_kill_job_by.now;
 
 	return foreach_kill_job_by.kill_job_cnt;
+}
+
+extern int kill_running_job_by_node_ptr(node_record_t *node_ptr)
+{
+	return _kill_running_job_by_node_ptr(node_ptr, false);
+}
+
+extern int kill_running_job_by_down_node_ptr(node_record_t *node_ptr,
+					     bool retain)
+{
+	xassert(!node_ptr || IS_NODE_DOWN(node_ptr));
+
+	return _kill_running_job_by_node_ptr(node_ptr, retain);
 }
 
 /* Remove one node from a job's allocation */
@@ -18177,14 +18237,20 @@ static int _resume_job_nodes(job_record_t *job_ptr, bool indf_susp)
 	node_record_t *node_ptr;
 	uint32_t node_flags;
 
-	if ((rc = select_g_job_resume(job_ptr, indf_susp)) != SLURM_SUCCESS)
-		return rc;
-
+	/*
+	 * Check before select_g_job_resume() so that nothing is resumed when
+	 * the job cannot be. A job can hold a DOWN node when it kept its
+	 * allocation through the DOWN (see job_retain_alloc_on_node_fail())
+	 * and was suspended afterwards; it resumes once the node is up.
+	 */
 	for (int i = 0; (node_ptr = next_node_bitmap(job_ptr->node_bitmap, &i));
 	     i++) {
 		if (IS_NODE_DOWN(node_ptr))
-			return SLURM_ERROR;
+			return ESLURM_NODE_NOT_AVAIL;
 	}
+
+	if ((rc = select_g_job_resume(job_ptr, indf_susp)) != SLURM_SUCCESS)
+		return rc;
 
 	for (int i = 0; (node_ptr = next_node_bitmap(job_ptr->node_bitmap, &i));
 	     i++) {

@@ -555,6 +555,14 @@ static void _set_node_mixed_op(node_info_t *node_ptr)
 	if (!node_ptr->name)
 		return;
 
+	/*
+	 * A DOWN node can still hold jobs that kept their allocation (external
+	 * jobs with kill_on_node_fail=0). Keep reporting it DOWN, as the
+	 * controller's statistics do.
+	 */
+	if (IS_NODE_DOWN(node_ptr) || IS_NODE_FUTURE(node_ptr))
+		return;
+
 	idle_cpus = node_ptr->cpus_efctv - node_ptr->alloc_cpus;
 
 	if (idle_cpus && (idle_cpus < node_ptr->cpus_efctv))

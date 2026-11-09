@@ -772,6 +772,8 @@ test_105_19  Test nodes held by an expedited requeue stay unavailable until the
 test_105_20  Test sbatch, salloc and srun --kv
 test_105_21  Test a job adds nodes beyond a node list shorter than it needs
 test_105_22  Test sbatch --external option handling across hetjob shapes
+test_105_23  Test an external --no-kill job keeps its allocation on a DOWN node
+test_105_24  Test an external --no-kill job is killed, not shrunk, on node loss
 
 test_106_#   Testing of sbcast options.
 =======================================

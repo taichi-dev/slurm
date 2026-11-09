@@ -2370,18 +2370,7 @@ static int _sync_nodes_to_active_job(job_record_t *job_ptr)
 
 	job_ptr->node_cnt = bit_set_count(node_bitmap);
 	for (int i = 0; (node_ptr = next_node_bitmap(node_bitmap, &i)); i++) {
-		if ((job_ptr->details &&
-		     (job_ptr->details->whole_node & WHOLE_NODE_USER)) ||
-		    (job_ptr->part_ptr &&
-		     (job_ptr->part_ptr->flags & PART_FLAG_EXCLUSIVE_USER))) {
-			node_ptr->owner_job_cnt++;
-			node_ptr->owner = job_ptr->user_id;
-		}
-
-		if (slurm_mcs_get_select(job_ptr) == 1) {
-			xfree(node_ptr->mcs_label);
-			node_ptr->mcs_label = xstrdup(job_ptr->mcs_label);
-		}
+		set_node_job_owner(node_ptr, job_ptr, true);
 
 		node_flags = node_ptr->node_state & NODE_STATE_FLAGS;
 
@@ -2406,13 +2395,24 @@ static int _sync_nodes_to_active_job(job_record_t *job_ptr)
 		if ((job_ptr->details) && (job_ptr->details->share_res == 0))
 			node_ptr->no_share_job_cnt++;
 
-		/* An arbitrary job's task layout requires all of its nodes. */
-		if (IS_NODE_DOWN(node_ptr) && IS_JOB_RUNNING(job_ptr) &&
-		    (job_ptr->kill_on_node_fail == 0) &&
-		    (job_ptr->node_cnt > 1) &&
-		    (!job_ptr->details ||
-		     ((job_ptr->details->task_dist & SLURM_DIST_STATE_BASE) !=
-		      SLURM_DIST_ARBITRARY))) {
+		if (IS_NODE_DOWN(node_ptr) &&
+		    job_retain_alloc_on_node_fail(job_ptr)) {
+			/*
+			 * The job kept its allocation when this node went
+			 * DOWN. _build_bitmaps() marked the DOWN node idle,
+			 * and also available and up if a reboot with
+			 * nextstate=resume is pending, which waits for the
+			 * job to end. Keep the node out of service until it
+			 * returns, as a running controller does. Its share
+			 * bit, owner and MCS label are already set for the job.
+			 */
+			info("Retaining %pJ allocation on DOWN node %s (external job with kill_on_node_fail=0)",
+			     job_ptr, node_ptr->name);
+			bit_clear(idle_node_bitmap, node_ptr->index);
+			bit_clear(avail_node_bitmap, node_ptr->index);
+			bit_clear(up_node_bitmap, node_ptr->index);
+		} else if (IS_NODE_DOWN(node_ptr) && IS_JOB_RUNNING(job_ptr) &&
+			   job_shrink_on_node_fail(job_ptr)) {
 			/* This should only happen if a job was running
 			 * on a node that was newly configured DOWN */
 			int save_accounting_enforce;
@@ -2478,6 +2478,19 @@ static void _sync_nodes_to_suspended_job(job_record_t *job_ptr)
 	for (int i = 0; (node_ptr = next_node_bitmap(job_ptr->node_bitmap, &i));
 	     i++) {
 		node_ptr->sus_job_cnt++;
+		/*
+		 * A suspended job can hold a DOWN node, as one that kept its
+		 * allocation when the node went DOWN (see
+		 * job_retain_alloc_on_node_fail()) and was suspended
+		 * afterwards. _build_bitmaps() marked the node available and
+		 * up if a reboot with nextstate=resume is pending, which
+		 * waits for the job to end. Keep the node out of service until
+		 * it returns, as _sync_nodes_to_active_job() does.
+		 */
+		if (IS_NODE_DOWN(node_ptr)) {
+			bit_clear(avail_node_bitmap, node_ptr->index);
+			bit_clear(up_node_bitmap, node_ptr->index);
+		}
 	}
 
 	set_initial_job_alias_list(job_ptr);
